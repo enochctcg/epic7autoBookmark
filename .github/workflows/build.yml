@@ -59,8 +59,19 @@ jobs:
           name: ${{ matrix.package }}
           path: ${{ matrix.package }}
 
-      - name: Attach to GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+  # 兩個平台都打包成功後, 才統一建立 Release (避免兩邊同時建立 Release 互相衝突)
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
         with:
-          files: ${{ matrix.package }}
+          path: packages
+          merge-multiple: true
+
+      - run: ls -la packages
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: packages/*.zip
