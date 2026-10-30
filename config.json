@@ -1,4 +1,5 @@
 {
     "adb_addr": "127.0.0.1:5555",
-    "e7_language": "zh-TW"
+    "e7_language": "zh-TW",
+    "adb_path": "/Applications/BlueStacks.app/Contents/MacOS/hd-adb"
 }

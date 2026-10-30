@@ -1,0 +1,65 @@
+# 在 GitHub 的雲端機器上打包 Windows exe 與 macOS app
+# 觸發方式:
+#   1. GitHub 網頁 -> Actions -> Build -> Run workflow (手動)
+#   2. 推送 v 開頭的 tag (例如 git tag v1.0.0 && git push origin v1.0.0), 會自動建立 Release 並附上壓縮檔
+name: Build
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            package: epic7autoBookmark-windows.zip
+          - os: macos-latest
+            package: epic7autoBookmark-macos.zip
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pyinstaller pillow
+
+      - name: Build
+        run: pyinstaller -y main.spec
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force release | Out-Null
+          Copy-Item dist/epic7autoBookmark.exe, config.json, README.md, LICENSE release/
+          Compress-Archive -Path release/* -DestinationPath ${{ matrix.package }}
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          mkdir release
+          cp -R dist/epic7autoBookmark.app release/
+          cp config.json README.md LICENSE release/
+          cd release && zip -r -y ../${{ matrix.package }} .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.package }}
+          path: ${{ matrix.package }}
+
+      - name: Attach to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.package }}

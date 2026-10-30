@@ -7,34 +7,185 @@
 
 from PyQt6 import QtCore, QtGui, QtWidgets
 
-from adbutils import adb, AdbDevice
-from numpy import asarray
+from numpy import asarray, fromfile, uint8
 import aircv
+import cv2
 import json
+import logging
+import os
 import random
+import shutil
+import sys
+import time
 
-file = open("config.json", "r", encoding="utf-8")
-config = json.load(file)
+IS_WINDOWS = sys.platform.startswith("win")
+IS_MACOS = sys.platform == "darwin"
+
+
+def app_dir() -> str:
+    """使用者可編輯檔案(config.json)所在的資料夾。
+
+    - 原始碼執行: main.py 所在資料夾
+    - Windows exe: main.exe 所在資料夾
+    - macOS .app: .app 所在資料夾 (不是 .app/Contents/MacOS 裡面)
+    """
+    if getattr(sys, "frozen", False):
+        exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+        if IS_MACOS and exe_dir.endswith(os.path.join(".app", "Contents", "MacOS")):
+            return os.path.abspath(os.path.join(exe_dir, "..", "..", ".."))
+        return exe_dir
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def resource_path(*parts: str) -> str:
+    """找圖片/圖示等資源: 先找 app 旁邊(方便使用者自行替換), 再找打包進去的。"""
+    candidates = [os.path.join(app_dir(), *parts)]
+    bundle_dir = getattr(sys, "_MEIPASS", None)
+    if bundle_dir:
+        candidates.append(os.path.join(bundle_dir, *parts))
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+        # 檔名大小寫不一致時(例如 .PNG / .png)也能找到, 避免在區分大小寫的檔案系統上失敗
+        folder, name = os.path.split(path)
+        if os.path.isdir(folder):
+            for entry in os.listdir(folder):
+                if entry.lower() == name.lower():
+                    return os.path.join(folder, entry)
+    return candidates[0]
+
+
+def load_config() -> dict:
+    config = {"adb_addr": "127.0.0.1:5555", "e7_language": "zh-TW", "adb_path": ""}
+    path = resource_path("config.json")
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            config.update(json.load(f))
+    except FileNotFoundError:
+        print(f"config.json not found at {path}, using defaults")
+    return config
+
+
+def find_adb(custom_path: str = "") -> str:
+    """回傳 adb 執行檔路徑, 找不到時回傳空字串交給 adbutils 自己處理。
+
+    macOS 從 Finder 開啟的 app 不會繼承 shell 的 PATH,
+    所以除了 PATH 之外還要檢查 Homebrew / Android SDK 的常見安裝位置。
+    """
+    if custom_path:
+        return os.path.expanduser(custom_path)
+    if os.getenv("ADBUTILS_ADB_PATH"):
+        return os.environ["ADBUTILS_ADB_PATH"]
+    exe = shutil.which("adb")
+    if exe:
+        return exe
+    home = os.path.expanduser("~")
+    if IS_MACOS:
+        candidates = [
+            "/opt/homebrew/bin/adb",
+            "/usr/local/bin/adb",
+            os.path.join(home, "Library/Android/sdk/platform-tools/adb"),
+            "/Applications/BlueStacks.app/Contents/MacOS/hd-adb",
+        ]
+    elif IS_WINDOWS:
+        candidates = [
+            os.path.join(os.getenv("LOCALAPPDATA", ""), "Android", "Sdk", "platform-tools", "adb.exe"),
+            r"C:\Program Files\BlueStacks_nxt\HD-Adb.exe",
+            r"C:\Program Files\BlueStacks\HD-Adb.exe",
+        ]
+    else:
+        candidates = [os.path.join(home, "Android/Sdk/platform-tools/adb")]
+    for path in candidates:
+        if path and os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return ""
+
+
+def load_template(*parts: str):
+    """讀取比對用的模板圖。
+
+    cv2.imread 在 Windows 上讀不了含中文的路徑, 改用 fromfile + imdecode。
+    """
+    path = resource_path(*parts)
+    image = cv2.imdecode(fromfile(path, dtype=uint8), cv2.IMREAD_COLOR)
+    if image is None:
+        raise FileNotFoundError(path)
+    return image
+
+
+config = load_config()
 adb_addr = config["adb_addr"]
 e7_language = config["e7_language"]
 
+_adb_exe = find_adb(config.get("adb_path", ""))
+if _adb_exe:
+    # adbutils 會優先使用這個環境變數指定的 adb (必須在 import adbutils 前設定)
+    os.environ["ADBUTILS_ADB_PATH"] = _adb_exe
 
-def pointOffset(point):
-    x = int(random.uniform(point.x - 2, point.x + 2))
-    y = int(random.uniform(point.y - 2, point.y + 2))
-    return (x, y)
+from adbutils import adb, AdbDevice  # noqa: E402
+
+# 依序嘗試: Windows 正黑體 → macOS 蘋方/黑體 → Linux Noto
+UI_FONT_FAMILIES = [
+    "Microsoft JhengHei",
+    "微軟正黑體",
+    "PingFang TC",
+    "Heiti TC",
+    "Noto Sans CJK TC",
+    "sans-serif",
+]
 
 
-def doubleClick(device: AdbDevice, x: int, y: int):
-    device.click(x, y)
-    device.click(x, y)
+class StopRequested(Exception):
+    pass
+
+
+LOG_DIR = os.path.join(app_dir(), "logs")
+DEBUG_SHOT_DIR = os.path.join(LOG_DIR, "screenshots")
+
+# 預期的模擬器解析度, 圖片模板和點擊位移都是以這個解析度做的
+EXPECTED_SIZE = (1920, 1080)
+
+COVENANT_PRICE = 184000
+MYSTIC_PRICE = 280000
+
+
+def setup_logger() -> logging.Logger:
+    """日誌同時輸出到終端機和 logs/ 資料夾下的檔案(每次啟動一個檔案)。"""
+    logger = logging.getLogger("epic7")
+    if logger.handlers:
+        return logger
+    logger.setLevel(logging.DEBUG)
+    fmt = logging.Formatter("%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s", "%H:%M:%S")
+
+    console = logging.StreamHandler(sys.stdout)
+    console.setLevel(logging.DEBUG)
+    console.setFormatter(fmt)
+    logger.addHandler(console)
+
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        path = os.path.join(LOG_DIR, time.strftime("epic7-%Y%m%d-%H%M%S.log"))
+        file_handler = logging.FileHandler(path, encoding="utf-8")
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(fmt)
+        logger.addHandler(file_handler)
+        logger.info(f"日誌檔: {path}")
+    except OSError as e:
+        logger.warning(f"無法建立日誌檔, 只輸出到終端機: {e}")
+    return logger
+
+
+log = setup_logger()
 
 
 class worker(QtCore.QThread):
-    startMode = 0
-    expectNum = 0
-    moneyNum = 0
-    stoneNum = 0
+    # 這次要花掉的天空石數量, 每 3 個更新一次商店
+    stoneBudget = 0
+
+    # 每個步驟的重試上限, 避免像以前一樣無限循環
+    MAX_ATTEMPTS = 5
+    # 點擊後等待畫面出現預期按鈕的時間(秒)
+    WAIT_TIMEOUT = 3.0
 
     isStart = QtCore.pyqtSignal()
     isProgress = QtCore.pyqtSignal(str)
@@ -42,338 +193,262 @@ class worker(QtCore.QThread):
     isError = QtCore.pyqtSignal()
 
     emitLog = QtCore.pyqtSignal(str)
-    emitMoney = QtCore.pyqtSignal(str)
-    emitStone = QtCore.pyqtSignal(str)
+    # (已用天空石, 預算, 聖約數量, 神秘數量)
+    emitStats = QtCore.pyqtSignal(int, int, int, int)
 
     def __init__(self):
         super().__init__()
+        self.device = None
+        self.templates = {}
 
-    def setVariable(self, startMode: int, expectNum: int, moneyNum: int, stoneNum: int, autoRestartDispatch: bool):
-        self.startMode = startMode
-        self.expectNum = expectNum
-        self.moneyNum = moneyNum
-        self.stoneNum = stoneNum
-        self.autoRestartDispatch = autoRestartDispatch
+    def setVariable(self, stoneBudget: int):
+        self.stoneBudget = stoneBudget
 
-    def processDispatchMissionComplete(self, device, restartDispatchButton):
-        if not self.autoRestartDispatch:
-            return
-        
-        screenshot = asarray(device.screenshot())
-        condifence = 0.75
-        restartDispatchButtonLocation = aircv.find_template(screenshot, restartDispatchButton, condifence)
-        
-        if restartDispatchButtonLocation:
-            print("dispatch mission completed!")
-            self.emitLog.emit("重新進行派遣任務")
-            
-            while True:
-                restartDispatchFoundResult: tuple = restartDispatchButtonLocation["result"]
-                doubleClick(
-                    device,
-                    restartDispatchFoundResult[0],
-                    restartDispatchFoundResult[1],
-                )
-                
-                QtCore.QThread.sleep(1)
+    # ---------- 共用工具 ----------
 
-                doubleClick(
-                    device,
-                    restartDispatchFoundResult[0],
-                    restartDispatchFoundResult[1],
-                )
-                
-                QtCore.QThread.sleep(1)
+    def info(self, msg: str):
+        """重要步驟: 終端機 + 日誌檔 + 小工具畫面"""
+        log.info(msg)
+        self.emitLog.emit(msg)
 
-                after_restartDispatch_screenshot = asarray(device.screenshot())
-                restartDispatchButtonLocationAfter = aircv.find_template(
-                    after_restartDispatch_screenshot, restartDispatchButton, condifence
-                )
-                
-                if not restartDispatchButtonLocationAfter:
-                    break
-                
-            QtCore.QThread.sleep(1)
+    def debug(self, msg: str):
+        """細節(每次比對的信心值等): 只到終端機 + 日誌檔, 避免洗掉小工具畫面"""
+        log.debug(msg)
+
+    def warn(self, msg: str):
+        log.warning(msg)
+        self.emitLog.emit(f"⚠ {msg}")
+
+    def wait_seconds(self, seconds: float):
+        """取代 QThread.sleep: 每 100ms 檢查一次是否按了停止。
+
+        原本用 QThread.terminate() 強制中止, 在 macOS 上可能直接讓程式崩潰,
+        改成在這裡丟出 StopRequested 讓 run() 自己結束。
+        """
+        for _ in range(max(1, int(seconds * 10))):
+            if self.isInterruptionRequested():
+                raise StopRequested()
+            QtCore.QThread.msleep(100)
+
+    def screenshot(self):
+        start = time.time()
+        image = asarray(self.device.screenshot().convert("RGB"))
+        # PIL 是 RGB, 模板是用 OpenCV 讀的 BGR, 轉成一致才不會影響彩色比對
+        image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+        self.debug(f"截圖 {image.shape[1]}x{image.shape[0]} 耗時 {(time.time() - start) * 1000:.0f}ms")
+        return image
+
+    def save_debug_shot(self, image, reason: str):
+        """找不到按鈕時把當下畫面存起來, 方便事後判斷原因"""
+        try:
+            os.makedirs(DEBUG_SHOT_DIR, exist_ok=True)
+            path = os.path.join(DEBUG_SHOT_DIR, time.strftime(f"%H%M%S-{reason}.png"))
+            cv2.imencode(".png", image)[1].tofile(path)
+            self.info(f"已儲存當下畫面: {path}")
+        except Exception as e:
+            log.warning(f"儲存畫面失敗: {e}")
+
+    def find(self, image, name: str, threshold: float = 0.9, rgb: bool = False):
+        """在畫面上找模板, 不論有沒有找到都記錄最高信心值和位置。"""
+        result = aircv.find_template(image, self.templates[name], 0.0, rgb)
+        if not result:
+            self.debug(f"比對 [{name}] 無結果")
+            return None
+        conf = result["confidence"]
+        x, y = (int(v) for v in result["result"])
+        found = conf >= threshold
+        self.debug(
+            f"比對 [{name}] 信心值={conf:.3f} 門檻={threshold} 位置=({x},{y}) -> {'找到' if found else '沒找到'}"
+        )
+        return (x, y) if found else None
+
+    def tap(self, x: int, y: int, what: str):
+        self.info(f"點擊 {what} ({x},{y})")
+        self.device.click(x, y)
+
+    def wait_for(self, name: str, timeout: float = None, threshold: float = 0.9, rgb: bool = False):
+        """點擊後持續截圖, 直到畫面出現指定按鈕或逾時。回傳 (位置, 最後一張截圖)"""
+        timeout = timeout or self.WAIT_TIMEOUT
+        deadline = time.time() + timeout
+        image = None
+        while True:
+            self.wait_seconds(0.3)
+            image = self.screenshot()
+            pos = self.find(image, name, threshold, rgb)
+            if pos:
+                return pos, image
+            if time.time() >= deadline:
+                self.debug(f"等待 [{name}] 逾時 ({timeout}s)")
+                return None, image
+
+    def wait_until_gone(self, name: str, timeout: float = None, threshold: float = 0.9, rgb: bool = False):
+        """點擊後確認按鈕消失(代表點擊生效)。"""
+        timeout = timeout or self.WAIT_TIMEOUT
+        deadline = time.time() + timeout
+        image = None
+        while True:
+            self.wait_seconds(0.3)
+            image = self.screenshot()
+            if not self.find(image, name, threshold, rgb):
+                return True, image
+            if time.time() >= deadline:
+                return False, image
+
+    # ---------- 動作 ----------
+
+    def buy_item(self, row_pos, label: str) -> bool:
+        """點擊書籤所在列 -> 等購買視窗 -> 點購買 -> 確認視窗關閉"""
+        target = (row_pos[0] + 800, row_pos[1] + 40)
+
+        buy_pos = None
+        image = None
+        for attempt in range(1, self.MAX_ATTEMPTS + 1):
+            self.tap(*target, f"{label}所在列 (第{attempt}次)")
+            buy_pos, image = self.wait_for("buyButton")
+            if buy_pos:
+                self.info(f"購買視窗已出現, 購買按鈕位置 {buy_pos}")
+                break
+            self.warn(f"點擊{label}後沒有出現購買視窗, 重試")
+        if not buy_pos:
+            self.warn(f"{label}: 重試 {self.MAX_ATTEMPTS} 次仍沒出現購買視窗, 略過")
+            self.save_debug_shot(image, f"no-buy-dialog-{label}")
+            return False
+
+        for attempt in range(1, self.MAX_ATTEMPTS + 1):
+            self.tap(*buy_pos, f"購買按鈕 (第{attempt}次)")
+            gone, image = self.wait_until_gone("buyButton", rgb=True)
+            if gone:
+                self.info(f"{label} 購買完成")
+                return True
+            self.warn("購買按鈕還在, 重試")
+        self.warn(f"{label}: 點了 {self.MAX_ATTEMPTS} 次購買按鈕仍未關閉視窗")
+        self.save_debug_shot(image, f"buy-not-closed-{label}")
+        return False
+
+    def refresh_shop(self, image) -> bool:
+        """點立即更新 -> 等確認視窗 -> 點確認 -> 確認視窗關閉"""
+        refresh_pos = self.find(image, "refreshButton")
+        if not refresh_pos:
+            self.warn("畫面上找不到「立即更新」按鈕")
+            self.save_debug_shot(image, "no-refresh-button")
+            return False
+
+        yes_pos = None
+        for attempt in range(1, self.MAX_ATTEMPTS + 1):
+            # 只點一下: 以前連點兩下, 第二下會點到確認視窗外面把視窗關掉
+            self.tap(*refresh_pos, f"立即更新 (第{attempt}次)")
+            yes_pos, image = self.wait_for("refreshYesButton")
+            if yes_pos:
+                self.info(f"確認視窗已出現, 確認按鈕位置 {yes_pos}")
+                break
+            self.warn("點擊立即更新後沒有出現確認視窗, 重試")
+        if not yes_pos:
+            self.save_debug_shot(image, "no-refresh-confirm")
+            raise RuntimeError(f"點了 {self.MAX_ATTEMPTS} 次立即更新, 都沒找到「確認」按鈕")
+
+        for attempt in range(1, self.MAX_ATTEMPTS + 1):
+            self.tap(*yes_pos, f"確認 (第{attempt}次)")
+            gone, image = self.wait_until_gone("refreshYesButton")
+            if gone:
+                self.info("確認視窗已關閉, 商店已更新")
+                return True
+            self.warn("確認按鈕還在, 重試")
+        self.save_debug_shot(image, "confirm-not-closed")
+        raise RuntimeError(f"點了 {self.MAX_ATTEMPTS} 次確認, 視窗都沒有關閉")
+
+    # ---------- 主流程 ----------
+
+    def publish_stats(self):
+        self.emitStats.emit(self.refreshTime * 3, self.stoneBudget, self.counts["covenant"], self.counts["mystic"])
+
+    def scan_and_buy(self, bought: dict):
+        """截一張圖, 聖約/神秘有出現就買。同一間商店每種最多一個, 所以買過(或試過)就不再找。"""
+        image = self.screenshot()
+        for key, label in (("covenant", "聖約書籤"), ("mystic", "神秘書籤")):
+            if bought[key]:
+                continue
+            pos = self.find(image, key)
+            if not pos:
+                self.debug(f"這個畫面沒有{label}")
+                continue
+            self.info(f"找到{label} {pos}")
+            bought[key] = True
+            if self.buy_item(pos, label):
+                self.counts[key] += 1
+                self.publish_stats()
 
     def run(self):
         self.isStart.emit()
 
-        print("startMode: ", self.startMode)
-        print("expectedNum: ", self.expectNum)
+        self.refreshTime = 0
+        self.counts = {"covenant": 0, "mystic": 0}
+        totalRefresh = self.stoneBudget // 3
+
+        log.info(f"===== 開始 天空石={self.stoneBudget} 預計更新 {totalRefresh} 次 =====")
 
         try:
-            self.emitLog.emit("===== 初始化 =====")
-
-            QtCore.QThread.sleep(1)
-
-            # check input
-            if self.moneyNum < 280000:
-                self.emitLog.emit("錯誤: 金幣不足28萬")
-                raise ValueError("out of money")
-
-            if self.stoneNum < 3:
-                self.emitLog.emit("錯誤: 天空石不足以刷新商店")
-                raise ValueError("out of stone")
-
-            if self.startMode == 3 and self.expectNum > self.stoneNum:
-                self.emitLog.emit("錯誤: 天空石使用數量大於持有數量")
-                raise ValueError("stone input error")
-
-            self.emitLog.emit("正在嘗試連接模擬器......")
-
-            QtCore.QThread.sleep(1)
+            self.info("===== 初始化 =====")
+            self.info(f"正在連接模擬器 {adb_addr} ......")
+            log.info(f"使用的 adb: {os.getenv('ADBUTILS_ADB_PATH') or '(adbutils 預設)'}")
 
             adb.connect(adb_addr, timeout=10)
+            self.device = adb.device(serial=adb_addr)
+            self.debug(f"裝置狀態: {self.device.get_state()}")
+            self.info("adb連接成功")
 
-            device = adb.device(serial=adb_addr)
+            self.templates = {
+                "covenant": load_template("img", "covenantLocation.png"),
+                "mystic": load_template("img", "mysticLocation.png"),
+                "buyButton": load_template("img", f"buyButton-{e7_language}.png"),
+                "refreshButton": load_template("img", f"refreshButton-{e7_language}.png"),
+                "refreshYesButton": load_template("img", f"refreshYesButton-{e7_language}.png"),
+            }
+            self.debug(f"模板已載入, 語系={e7_language}")
 
-            self.emitLog.emit("adb連接成功")
+            first = self.screenshot()
+            size = (first.shape[1], first.shape[0])
+            self.info(f"模擬器畫面解析度: {size[0]}x{size[1]}")
+            if size != EXPECTED_SIZE:
+                self.warn(f"解析度不是 {EXPECTED_SIZE[0]}x{EXPECTED_SIZE[1]}, 按鈕可能會比對不到")
 
-            QtCore.QThread.sleep(1)
+            self.info(f"初始化完成, 將使用 {totalRefresh * 3} 個天空石更新 {totalRefresh} 次")
+            self.publish_stats()
 
-            self.emitLog.emit("初始化完成")
+            # 目前這間商店也要檢查, 所以總共看 totalRefresh + 1 間
+            for shop in range(totalRefresh + 1):
+                self.info(f"===== 第 {shop + 1}/{totalRefresh + 1} 間商店 =====")
+                bought = {"covenant": False, "mystic": False}
 
-            QtCore.QThread.sleep(1)
+                self.scan_and_buy(bought)  # 上半部
+                if not all(bought.values()):
+                    self.info("往下滑動商店列表")
+                    self.device.swipe(1400, 500, 1400, 200, 0.1)
+                    self.wait_seconds(1)
+                    self.scan_and_buy(bought)  # 下半部
 
-            self.emitLog.emit("===== 刷商店 =====")
+                if shop < totalRefresh:
+                    self.info("準備更新商店")
+                    self.refresh_shop(self.screenshot())
+                    self.refreshTime += 1
+                    self.publish_stats()
+                    self.wait_seconds(1)
 
-            QtCore.QThread.sleep(1)
-
-            refreshTime = 0
-            covenantFoundTime = 0
-            mysticFoundTime = 0
-
-            covenant = aircv.imread("./img/covenantLocation.png")
-            mystic = aircv.imread("./img/mysticLocation.png")
-            buyButton = aircv.imread(f"./img/buyButton-{e7_language}.png")
-            refreshButton = aircv.imread(f"./img/refreshButton-{e7_language}.png")
-            refreshYesButton = aircv.imread(f"./img/refreshYesButton-{e7_language}.png")
-            restartDispatchButton = aircv.imread(f"./img/restartDispatchButton-{e7_language}.png")
-            
-            needRefresh = False
-            covenantFound = False
-            mysticFound = False
-
-            while self.expectNum > 0 and self.moneyNum > 280000 and self.stoneNum >= 3:
-                screenshot = asarray(device.screenshot())
-
-                covenantLocation = aircv.find_template(screenshot, covenant, 0.9)
-                if covenantLocation and (not covenantFound):
-                    covenantFound = True
-
-                    print("find covenant!")
-                    self.emitLog.emit("找到聖約書籤")
-
-                    while True:
-                        covenantFoundResult: tuple = covenantLocation["result"]
-                        doubleClick(
-                            device,
-                            covenantFoundResult[0] + 800,
-                            covenantFoundResult[1] + 40,
-                        )
-
-                        QtCore.QThread.sleep(1)
-                        
-                        self.processDispatchMissionComplete(device, restartDispatchButton)
-
-                        buy_screenshot = asarray(device.screenshot())
-                        buyButtonLocation = aircv.find_template(
-                            buy_screenshot, buyButton, 0.9
-                        )
-
-                        if buyButtonLocation:
-                            buyButtonFoundResult: tuple = buyButtonLocation["result"]
-
-                            while True:
-                                doubleClick(
-                                    device,
-                                    buyButtonFoundResult[0],
-                                    buyButtonFoundResult[1],
-                                )
-
-                                QtCore.QThread.sleep(1)
-                                
-                                self.processDispatchMissionComplete(device, restartDispatchButton)
-
-                                after_buy_screenshot = asarray(device.screenshot())
-                                buyButtonLocationAfter = aircv.find_template(
-                                    after_buy_screenshot, buyButton, 0.9, True
-                                )
-
-                                if not buyButtonLocationAfter:
-                                    break
-
-                                QtCore.QThread.sleep(1)
-
-                            if self.startMode == 1:
-                                self.expectNum -= 1
-                                self.emitLog.emit(f"剩餘次數: {self.expectNum}次")
-
-                            self.moneyNum = self.moneyNum - 184000
-                            covenantFoundTime += 1
-                            self.emitMoney.emit(str(self.moneyNum))
-
-                            break
-
-                        QtCore.QThread.sleep(1)
-
-                else:
-                    print("not find covenant!")
-
-                mysticLocation = aircv.find_template(screenshot, mystic, 0.9)
-                if mysticLocation and (not mysticFound):
-                    mysticFound = True
-
-                    print("find mystic!")
-                    self.emitLog.emit("找到神秘書籤")
-
-                    while True:
-                        mysticFoundResult: tuple = mysticLocation["result"]
-                        doubleClick(
-                            device,
-                            mysticFoundResult[0] + 800,
-                            mysticFoundResult[1] + 40,
-                        )
-
-                        QtCore.QThread.sleep(1)
-                        
-                        self.processDispatchMissionComplete(device, restartDispatchButton)
-
-                        buy_screenshot = asarray(device.screenshot())
-                        buyButtonLocation = aircv.find_template(
-                            buy_screenshot, buyButton, 0.9
-                        )
-
-                        if buyButtonLocation:
-                            buyButtonFoundResult: tuple = buyButtonLocation["result"]
-
-                            while True:
-                                doubleClick(
-                                    device,
-                                    buyButtonFoundResult[0],
-                                    buyButtonFoundResult[1],
-                                )
-
-                                QtCore.QThread.sleep(1)
-                                
-                                self.processDispatchMissionComplete(device, restartDispatchButton)
-
-                                after_buy_screenshot = asarray(device.screenshot())
-                                buyButtonLocationAfter = aircv.find_template(
-                                    after_buy_screenshot, buyButton, 0.9, True
-                                )
-
-                                if not buyButtonLocationAfter:
-                                    break
-
-                                QtCore.QThread.sleep(1)
-
-                            if self.startMode == 2:
-                                self.expectNum -= 1
-                                self.emitLog.emit(f"剩餘次數: {self.expectNum}次")
-
-                            self.moneyNum = self.moneyNum - 280000
-                            mysticFoundTime += 1
-                            self.emitMoney.emit(str(self.moneyNum))
-
-                            break
-
-                        QtCore.QThread.sleep(1)
-
-                else:
-                    print("not find mystic!")
-                    
-                if needRefresh:
-                    refreshButtonLocation = aircv.find_template(
-                        screenshot, refreshButton, 0.9
-                    )
-                    while True:
-                        refreshButtonFoundResult: tuple = refreshButtonLocation[
-                            "result"
-                        ]
-                        doubleClick(
-                            device,
-                            refreshButtonFoundResult[0],
-                            refreshButtonFoundResult[1],
-                        )
-
-                        QtCore.QThread.sleep(1)
-
-                        self.processDispatchMissionComplete(device, restartDispatchButton)
-
-                        confirm_screenshot = asarray(device.screenshot())
-                        refreshYesButtonLocation = aircv.find_template(
-                            confirm_screenshot, refreshYesButton, 0.9
-                        )
-
-                        if refreshYesButtonLocation:
-                            refreshYesButtonFoundResult: tuple = (
-                                refreshYesButtonLocation["result"]
-                            )
-
-                            while True:
-                                doubleClick(
-                                    device,
-                                    refreshYesButtonFoundResult[0],
-                                    refreshYesButtonFoundResult[1],
-                                )
-
-                                QtCore.QThread.sleep(1)
-
-                                self.processDispatchMissionComplete(device, restartDispatchButton)
-
-                                after_click_yes_screenshot = asarray(
-                                    device.screenshot()
-                                )
-                                refreshYesButtonLocation = aircv.find_template(
-                                    after_click_yes_screenshot, refreshYesButton, 0.9
-                                )
-
-                                if not refreshYesButtonLocation:
-                                    break
-
-                                QtCore.QThread.sleep(1)
-
-                            self.stoneNum = self.stoneNum - 3
-                            self.emitStone.emit(str(self.stoneNum))
-
-                            refreshTime += 1
-
-                            if self.startMode == 3:
-                                self.expectNum -= 3
-                                self.emitLog.emit(f"剩餘次數: {int(self.expectNum/3)}次")
-
-                            needRefresh = False
-                            covenantFound = False
-                            mysticFound = False
-
-                            QtCore.QThread.sleep(1)
-
-                            break
-
-                        QtCore.QThread.sleep(1)
-
-                else:
-                    device.swipe(1400, 500, 1400, 200, 0.1)
-                    needRefresh = True
-
-                    QtCore.QThread.sleep(1)
-                    self.processDispatchMissionComplete(device, restartDispatchButton)
-
-            # finished report
-            self.emitLog.emit("===== 結算 =====")
-            self.emitLog.emit("共花費:")
-            self.emitLog.emit(f"天空石: {refreshTime*3}個")
-            self.emitLog.emit(f"金幣: {covenantFoundTime*184000+mysticFoundTime*280000}元")
-            self.emitLog.emit("獲得書籤:")
-            self.emitLog.emit(f"聖約: {covenantFoundTime}次")
-            self.emitLog.emit(f"神秘: {mysticFoundTime}次")
+            self.info("===== 結算 =====")
+            self.info(f"天空石: {self.refreshTime * 3}個 (更新 {self.refreshTime} 次)")
+            self.info(f"金幣: {self.counts['covenant'] * COVENANT_PRICE + self.counts['mystic'] * MYSTIC_PRICE:,}元")
+            self.info(f"聖約書籤: {self.counts['covenant']}次")
+            self.info(f"神秘書籤: {self.counts['mystic']}次")
 
             self.isFinish.emit()
 
+        except StopRequested:
+            log.info(f"使用者按下停止 (已更新 {self.refreshTime} 次, 聖約 {self.counts['covenant']}, 神秘 {self.counts['mystic']})")
+
         except Exception as e:
-            print(e)
-            # self.emitLog.emit(str(e))
+            log.exception("執行時發生錯誤")
+            self.emitLog.emit(f"錯誤: {type(e).__name__}: {e}")
+            if "adb" in type(e).__module__ or isinstance(e, (ConnectionError, OSError)):
+                self.emitLog.emit(f"請確認模擬器已開啟 ADB, 且 config.json 的 adb_addr ({adb_addr}) 正確")
             self.isError.emit()
 
 
@@ -382,360 +457,105 @@ class Ui_Main(object):
 
     def setupUi(self, Main):
         Main.setObjectName("Main")
-        Main.resize(310, 460)
-        Main.setMinimumSize(QtCore.QSize(310, 500))
-        Main.setMaximumSize(QtCore.QSize(310, 500))
+        Main.setWindowTitle("第七史詩刷商店小工具")
+        Main.resize(340, 520)
         font = QtGui.QFont()
-        font.setFamily("微軟正黑體")
+        font.setFamilies(UI_FONT_FAMILIES)
         font.setPointSize(12)
         Main.setFont(font)
-        self.tabWidget = QtWidgets.QTabWidget(Main)
-        self.tabWidget.setGeometry(QtCore.QRect(5, 5, 300, 490))
-        self.tabWidget.setMinimumSize(QtCore.QSize(300, 490))
-        self.tabWidget.setMaximumSize(QtCore.QSize(300, 490))
-        font = QtGui.QFont()
-        font.setFamily("微軟正黑體")
-        font.setPointSize(12)
-        self.tabWidget.setFont(font)
-        self.tabWidget.setStyleSheet("")
-        self.tabWidget.setObjectName("tabWidget")
-        self.functionTab = QtWidgets.QWidget()
-        self.functionTab.setMinimumSize(QtCore.QSize(300, 490))
-        self.functionTab.setMaximumSize(QtCore.QSize(300, 490))
-        font = QtGui.QFont()
-        font.setFamily("微軟正黑體")
-        font.setPointSize(12)
-        self.functionTab.setFont(font)
-        self.functionTab.setObjectName("functionTab")
-        self.covenantInput = QtWidgets.QLineEdit(self.functionTab)
-        self.covenantInput.setGeometry(QtCore.QRect(140, 130, 70, 20))
-        font = QtGui.QFont()
-        font.setFamily("微軟正黑體")
-        font.setPointSize(12)
-        self.covenantInput.setFont(font)
-        self.covenantInput.setLayoutDirection(QtCore.Qt.LayoutDirection.RightToLeft)
-        self.covenantInput.setAlignment(
-            QtCore.Qt.AlignmentFlag.AlignRight
-            | QtCore.Qt.AlignmentFlag.AlignTrailing
-            | QtCore.Qt.AlignmentFlag.AlignVCenter
-        )
-        self.covenantInput.setObjectName("covenantInput")
-        self.mysticInput = QtWidgets.QLineEdit(self.functionTab)
-        self.mysticInput.setGeometry(QtCore.QRect(140, 170, 70, 20))
-        font = QtGui.QFont()
-        font.setFamily("微軟正黑體")
-        font.setPointSize(12)
-        self.mysticInput.setFont(font)
-        self.mysticInput.setLayoutDirection(QtCore.Qt.LayoutDirection.RightToLeft)
-        self.mysticInput.setAlignment(
-            QtCore.Qt.AlignmentFlag.AlignRight
-            | QtCore.Qt.AlignmentFlag.AlignTrailing
-            | QtCore.Qt.AlignmentFlag.AlignVCenter
-        )
-        self.mysticInput.setObjectName("mysticInput")
-        self.moneyTextShowLabel = QtWidgets.QLabel(self.functionTab)
-        self.moneyTextShowLabel.setGeometry(QtCore.QRect(40, 10, 60, 20))
-        font = QtGui.QFont()
-        font.setFamily("微軟正黑體")
-        font.setPointSize(12)
-        self.moneyTextShowLabel.setFont(font)
-        self.moneyTextShowLabel.setObjectName("moneyTextShowLabel")
-        self.moneyTotalShowEdit = QtWidgets.QLineEdit(self.functionTab)
-        self.moneyTotalShowEdit.setGeometry(QtCore.QRect(120, 10, 111, 20))
-        font = QtGui.QFont()
-        font.setFamily("微軟正黑體")
-        font.setPointSize(12)
-        self.moneyTotalShowEdit.setFont(font)
-        self.moneyTotalShowEdit.setLayoutDirection(
-            QtCore.Qt.LayoutDirection.RightToLeft
-        )
-        self.moneyTotalShowEdit.setAlignment(
-            QtCore.Qt.AlignmentFlag.AlignRight
-            | QtCore.Qt.AlignmentFlag.AlignTrailing
-            | QtCore.Qt.AlignmentFlag.AlignVCenter
-        )
-        self.moneyTotalShowEdit.setObjectName("moneyTotalShowEdit")
-        self.divider = QtWidgets.QFrame(self.functionTab)
-        self.divider.setGeometry(QtCore.QRect(10, 60, 271, 20))
-        self.divider.setFrameShape(QtWidgets.QFrame.Shape.HLine)
-        self.divider.setFrameShadow(QtWidgets.QFrame.Shadow.Sunken)
-        self.divider.setObjectName("divider")
-        self.stoneTextShowLabel = QtWidgets.QLabel(self.functionTab)
-        self.stoneTextShowLabel.setGeometry(QtCore.QRect(40, 40, 60, 20))
-        font = QtGui.QFont()
-        font.setFamily("微軟正黑體")
-        font.setPointSize(12)
-        self.stoneTextShowLabel.setFont(font)
-        self.stoneTextShowLabel.setObjectName("stoneTextShowLabel")
-        self.stoneTotalShowEdit = QtWidgets.QLineEdit(self.functionTab)
-        self.stoneTotalShowEdit.setGeometry(QtCore.QRect(119, 40, 111, 20))
-        font = QtGui.QFont()
-        font.setFamily("微軟正黑體")
-        font.setPointSize(12)
-        self.stoneTotalShowEdit.setFont(font)
-        self.stoneTotalShowEdit.setLayoutDirection(
-            QtCore.Qt.LayoutDirection.RightToLeft
-        )
-        self.stoneTotalShowEdit.setAlignment(
-            QtCore.Qt.AlignmentFlag.AlignRight
-            | QtCore.Qt.AlignmentFlag.AlignTrailing
-            | QtCore.Qt.AlignmentFlag.AlignVCenter
-        )
-        self.stoneTotalShowEdit.setObjectName("stoneTotalShowEdit")
-        self.startButton = QtWidgets.QPushButton(self.functionTab)
-        self.startButton.setGeometry(QtCore.QRect(140, 400, 100, 40))
-        font = QtGui.QFont()
-        font.setFamily("微軟正黑體")
-        font.setPointSize(12)
-        self.startButton.setFont(font)
-        self.startButton.setStyleSheet("")
-        self.startButton.setDefault(False)
-        self.startButton.setFlat(False)
-        self.startButton.setObjectName("startButton")
+
+        layout = QtWidgets.QVBoxLayout(Main)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+
+        # 天空石輸入
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(QtWidgets.QLabel("要使用的天空石"))
+        self.stoneSpin = QtWidgets.QSpinBox()
+        self.stoneSpin.setRange(0, 999999)
+        self.stoneSpin.setSingleStep(3)
+        self.stoneSpin.setValue(30)
+        self.stoneSpin.setSuffix(" 個")
+        self.stoneSpin.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
+        self.stoneSpin.valueChanged.connect(self.updateHint)
+        row.addWidget(self.stoneSpin, 1)
+        layout.addLayout(row)
+
+        self.hintLabel = QtWidgets.QLabel()
+        self.hintLabel.setStyleSheet("color: gray;")
+        layout.addWidget(self.hintLabel)
+
+        self.startButton = QtWidgets.QPushButton("開始")
+        self.startButton.setMinimumHeight(40)
         self.startButton.clicked.connect(self.startPressEvent)
-        self.covenantTimeLabel = QtWidgets.QLabel(self.functionTab)
-        self.covenantTimeLabel.setGeometry(QtCore.QRect(220, 130, 20, 20))
-        self.covenantTimeLabel.setObjectName("covenantTimeLabel")
-        self.mysticTimeLabel = QtWidgets.QLabel(self.functionTab)
-        self.mysticTimeLabel.setGeometry(QtCore.QRect(220, 170, 20, 20))
-        self.mysticTimeLabel.setObjectName("mysticTimeLabel")
-        self.logTextBrowser = QtWidgets.QTextBrowser(self.functionTab)
-        self.logTextBrowser.setGeometry(QtCore.QRect(40, 250, 200, 131))
-        font = QtGui.QFont()
-        font.setPointSize(10)
-        self.logTextBrowser.setFont(font)
-        self.logTextBrowser.setObjectName("logTextBrowser")
-        self.stoneTimeLabel = QtWidgets.QLabel(self.functionTab)
-        self.stoneTimeLabel.setGeometry(QtCore.QRect(220, 210, 20, 20))
-        self.stoneTimeLabel.setObjectName("stoneTimeLabel")
-        self.stoneInput = QtWidgets.QLineEdit(self.functionTab)
-        self.stoneInput.setGeometry(QtCore.QRect(140, 210, 70, 20))
-        font = QtGui.QFont()
-        font.setFamily("微軟正黑體")
-        font.setPointSize(12)
-        self.stoneInput.setFont(font)
-        self.stoneInput.setLayoutDirection(QtCore.Qt.LayoutDirection.RightToLeft)
-        self.stoneInput.setAlignment(
-            QtCore.Qt.AlignmentFlag.AlignRight
-            | QtCore.Qt.AlignmentFlag.AlignTrailing
-            | QtCore.Qt.AlignmentFlag.AlignVCenter
+        layout.addWidget(self.startButton)
+
+        self.statsLabel = QtWidgets.QLabel()
+        layout.addWidget(self.statsLabel)
+
+        self.logTextBrowser = QtWidgets.QTextBrowser()
+        logFont = QtGui.QFont()
+        logFont.setFamilies(UI_FONT_FAMILIES)
+        logFont.setPointSize(10)
+        self.logTextBrowser.setFont(logFont)
+        self.logTextBrowser.setPlainText(
+            "使用方式:\n"
+            "1. 遊戲進到秘密商店\n"
+            "2. 輸入要花掉的天空石數量 (每 3 個更新一次)\n"
+            "3. 按開始, 聖約書籤和神秘書籤出現就會自動購買\n\n"
+            "請自行確認金幣足夠。"
         )
-        self.stoneInput.setObjectName("stoneInput")
-        self.autoRestartDispatchCheckbox = QtWidgets.QCheckBox(self.functionTab)
-        self.autoRestartDispatchCheckbox.setGeometry(QtCore.QRect(40, 90, 150, 21))
-        self.autoRestartDispatchCheckbox.setObjectName("autoRestartDispatchCheckbox")
-        self.autoRestartDispatchCheckbox.setChecked(False)
-        self.covenantRadioButton = QtWidgets.QRadioButton(self.functionTab)
-        self.covenantRadioButton.setGeometry(QtCore.QRect(40, 130, 91, 21))
-        self.covenantRadioButton.setChecked(True)
-        self.covenantRadioButton.setObjectName("covenantRadioButton")
-        self.mysticRadioButton = QtWidgets.QRadioButton(self.functionTab)
-        self.mysticRadioButton.setGeometry(QtCore.QRect(40, 170, 91, 21))
-        self.mysticRadioButton.setObjectName("mysticRadioButton")
-        self.stoneRadioButton = QtWidgets.QRadioButton(self.functionTab)
-        self.stoneRadioButton.setGeometry(QtCore.QRect(40, 210, 91, 21))
-        self.stoneRadioButton.setObjectName("stoneRadioButton")
-        self.tabWidget.addTab(self.functionTab, "")
-        self.introductionTab = QtWidgets.QWidget()
-        self.introductionTab.setMinimumSize(QtCore.QSize(300, 450))
-        self.introductionTab.setMaximumSize(QtCore.QSize(300, 450))
-        font = QtGui.QFont()
-        font.setFamily("微軟正黑體")
-        font.setPointSize(12)
-        self.introductionTab.setFont(font)
-        self.introductionTab.setObjectName("introductionTab")
-        self.textBrowser = QtWidgets.QTextBrowser(self.introductionTab)
-        self.textBrowser.setGeometry(QtCore.QRect(20, 200, 256, 192))
-        self.textBrowser.setObjectName("textBrowser")
-        self.githubText = QtWidgets.QLabel(self.introductionTab)
-        self.githubText.setGeometry(QtCore.QRect(20, 20, 61, 20))
-        font = QtGui.QFont()
-        font.setFamily("微軟正黑體")
-        font.setPointSize(12)
-        self.githubText.setFont(font)
-        self.githubText.setObjectName("githubText")
-        self.githubTextUrl = QtWidgets.QLabel(self.introductionTab)
-        self.githubTextUrl.setGeometry(QtCore.QRect(20, 40, 251, 41))
-        font = QtGui.QFont()
-        font.setFamily("微軟正黑體")
-        font.setPointSize(11)
-        self.githubTextUrl.setFont(font)
-        self.githubTextUrl.setScaledContents(False)
-        self.githubTextUrl.setWordWrap(True)
-        self.githubTextUrl.setOpenExternalLinks(True)
-        self.githubTextUrl.setObjectName("githubTextUrl")
-        self.tabWidget.addTab(self.introductionTab, "")
+        layout.addWidget(self.logTextBrowser, 1)
 
         self.worker = worker()
         self.worker.isStart.connect(self.startWorker)
         self.worker.isFinish.connect(self.stopWorker)
-        self.worker.isError.connect(self.errorWorker)
-
+        self.worker.isError.connect(self.stopWorker)
         self.worker.emitLog.connect(lambda text: self.logTextBrowser.append(text))
-        self.worker.emitMoney.connect(
-            lambda text: self.moneyTotalShowEdit.setText(text)
-        )
-        self.worker.emitStone.connect(
-            lambda text: self.stoneTotalShowEdit.setText(text)
-        )
+        self.worker.emitStats.connect(self.updateStats)
 
-        self.retranslateUi(Main)
-        self.tabWidget.setCurrentIndex(0)
-        QtCore.QMetaObject.connectSlotsByName(Main)
+        self.updateHint()
+        self.updateStats(0, self.stoneSpin.value(), 0, 0)
 
-    def retranslateUi(self, Main):
-        _translate = QtCore.QCoreApplication.translate
-        Main.setWindowTitle(_translate("Main", "第七史詩刷商店小工具"))
-        self.covenantInput.setText(_translate("Main", "0"))
-        self.mysticInput.setText(_translate("Main", "0"))
-        self.moneyTextShowLabel.setText(_translate("Main", "金幣"))
-        self.moneyTotalShowEdit.setText(_translate("Main", "0"))
-        self.stoneTextShowLabel.setText(_translate("Main", "天空石"))
-        self.stoneTotalShowEdit.setText(_translate("Main", "0"))
-        self.startButton.setText(_translate("Main", "開始"))
-        self.covenantTimeLabel.setText(_translate("Main", "次"))
-        self.mysticTimeLabel.setText(_translate("Main", "次"))
-        self.logTextBrowser.setHtml(
-            _translate(
-                "Main",
-                '<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.0//EN" "http://www.w3.org/TR/REC-html40/strict.dtd">\n'
-                '<html><head><meta name="qrichtext" content="1" /><style type="text/css">\n'
-                "p, li { white-space: pre-wrap; }\n"
-                "</style></head><body style=\" font-family:'微軟正黑體'; font-size:10pt; font-weight:400; font-style:normal;\">\n"
-                '<p style=" margin-top:0px; margin-bottom:0px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px;">毫無反應, 就是個小工具</p></body></html>',
-            )
-        )
-        self.stoneTimeLabel.setText(_translate("Main", "個"))
-        self.stoneInput.setText(_translate("Main", "0"))
-        self.autoRestartDispatchCheckbox.setText(_translate("Main", "自動重新派遣"))
-        self.covenantRadioButton.setText(_translate("Main", "聖約書籤"))
-        self.mysticRadioButton.setText(_translate("Main", "神秘書籤"))
-        self.stoneRadioButton.setText(_translate("Main", "天空石"))
-        self.tabWidget.setTabText(
-            self.tabWidget.indexOf(self.functionTab), _translate("Main", "功能")
-        )
-        self.textBrowser.setHtml(
-            _translate(
-                "Main",
-                '<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.0//EN" "http://www.w3.org/TR/REC-html40/strict.dtd">\n'
-                '<html><head><meta name="qrichtext" content="1" /><style type="text/css">\n'
-                "p, li { white-space: pre-wrap; }\n"
-                "</style></head><body style=\" font-family:'微軟正黑體'; font-size:12pt; font-weight:400; font-style:normal;\">\n"
-                '<p style=" margin-top:0px; margin-bottom:0px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px;">啟動條件:</p>\n'
-                '<p style=" margin-top:0px; margin-bottom:0px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px;">金幣至少280000元</p>\n'
-                '<p style=" margin-top:0px; margin-bottom:0px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px;">天空石至少3個</p>\n'
-                '<p style="-qt-paragraph-type:empty; margin-top:0px; margin-bottom:0px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px;"><br /></p>\n'
-                '<p style=" margin-top:0px; margin-bottom:0px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px;">填的數字為停止的條件，</p>\n'
-                '<p style=" margin-top:0px; margin-bottom:0px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px;">刷到的神秘與聖約都會買，</p>\n'
-                '<p style=" margin-top:0px; margin-bottom:0px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px;">目前沒有只買某種的功能，</p>\n'
-                '<p style=" margin-top:0px; margin-bottom:0px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px;">未來也不會做。</p></body></html>',
-            )
-        )
-        self.githubText.setText(_translate("Main", "GitHub:"))
-        self.githubTextUrl.setText(
-            _translate(
-                "Main",
-                '<a href="https://www.github.com/steven010116/epic7autoBookmark">https://www.github.com/steven010116/epic7autoBookmark</a>',
-            )
-        )
-        self.tabWidget.setTabText(
-            self.tabWidget.indexOf(self.introductionTab), _translate("Main", "簡介")
-        )
+    def updateHint(self):
+        stones = self.stoneSpin.value()
+        times = stones // 3
+        text = f"會更新商店 {times} 次 (加上目前這間, 共檢查 {times + 1} 間)"
+        if stones % 3:
+            text += f"\n多出的 {stones % 3} 個不會使用"
+        self.hintLabel.setText(text)
+
+    def updateStats(self, used: int, budget: int, covenant: int, mystic: int):
+        self.statsLabel.setText(f"天空石 {used}/{budget}　聖約 {covenant}　神秘 {mystic}")
 
     def startPressEvent(self):
-        self.start = not self.start
-
-        if self.start:
-            startMode = 0
-            expectNum = 0
-            moneyNum = (
-                int(self.moneyTotalShowEdit.text())
-                if self.moneyTotalShowEdit.text().isdigit()
-                else 0
-            )
-            stoneNum = (
-                int(self.stoneTotalShowEdit.text())
-                if self.stoneTotalShowEdit.text().isdigit()
-                else 0
-            )
-            autoRestartDispatch = self.autoRestartDispatchCheckbox.isChecked()
-
-            if moneyNum == 0 or stoneNum == 0:
-                self.logTextBrowser.setText("")
-                self.logTextBrowser.append("石頭或金幣輸入錯誤")
-                self.logTextBrowser.append("===== 停止 =====")
-                self.start = not self.start
-                self.startProperty(False)
+        if not self.start:
+            if self.worker.isRunning():
+                self.logTextBrowser.append("上一輪還在停止中, 請稍候再按")
                 return
-
-            if self.covenantRadioButton.isChecked():
-                startMode = 1
-                covenant = self.covenantInput.text()
-                expectNum = int(covenant) if covenant.isdigit() else 0
-                self.covenantInput.setText(str(expectNum))
-
-            elif self.mysticRadioButton.isChecked():
-                startMode = 2
-                mystic = self.mysticInput.text()
-                expectNum = int(mystic) if mystic.isdigit() else 0
-                self.mysticInput.setText(str(expectNum))
-
-            elif self.stoneRadioButton.isChecked():
-                startMode = 3
-                stone = self.stoneInput.text()
-                expectNum = int(stone) if stone.isdigit() else 0
-                self.stoneInput.setText(str(expectNum))
-
-            else:
-                self.logTextBrowser.append("沒有選取的radioButton,")
-                self.logTextBrowser.append("明明就預設會選一個,")
-                self.logTextBrowser.append("你是怎麼取消掉的? 能不能教我?")
-                self.logTextBrowser.append("===== 停止 =====")
-                self.start = not self.start
-                self.startProperty(False)
-                return
-
-            self.worker.setVariable(startMode, expectNum, moneyNum, stoneNum, autoRestartDispatch)
+            self.worker.setVariable(self.stoneSpin.value())
             self.worker.start()
         else:
-            self.worker.terminate()
+            self.worker.requestInterruption()
             self.logTextBrowser.append("===== 停止 =====")
-            self.startProperty(False)
+            self.stopWorker()
 
-    def startProperty(self, isDisabled: bool):
-        if isDisabled:
-            self.startButton.setText("停止")
-        else:
-            self.startButton.setText("開始")
-
-        self.covenantRadioButton.setDisabled(isDisabled)
-        self.mysticRadioButton.setDisabled(isDisabled)
-        self.stoneRadioButton.setDisabled(isDisabled)
-        self.moneyTotalShowEdit.setDisabled(isDisabled)
-        self.stoneTotalShowEdit.setDisabled(isDisabled)
-        self.covenantInput.setDisabled(isDisabled)
-        self.mysticInput.setDisabled(isDisabled)
-        self.stoneInput.setDisabled(isDisabled)
-        self.autoRestartDispatchCheckbox.setDisabled(isDisabled)
+    def setRunning(self, running: bool):
+        self.start = running
+        self.startButton.setText("停止" if running else "開始")
+        self.stoneSpin.setDisabled(running)
 
     def startWorker(self):
-        self.logTextBrowser.setText("")
-        self.startProperty(True)
-
-    def errorWorker(self):
-        self.start = False
-        self.startProperty(False)
+        self.logTextBrowser.clear()
+        self.setRunning(True)
 
     def stopWorker(self):
-        self.start = False
-        self.startProperty(False)
+        self.setRunning(False)
 
 
 if __name__ == "__main__":
-    import sys
-
     app = QtWidgets.QApplication(sys.argv)
-    app.setWindowIcon(QtGui.QIcon("main.ico"))
+    app.setWindowIcon(QtGui.QIcon(resource_path("main.ico")))
 
     Main = QtWidgets.QWidget()
     ui = Ui_Main()
