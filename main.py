@@ -55,50 +55,122 @@ def resource_path(*parts: str) -> str:
     return candidates[0]
 
 
-def load_config() -> dict:
-    config = {"adb_addr": "127.0.0.1:5555", "e7_language": "zh-TW", "adb_path": ""}
-    path = resource_path("config.json")
+APP_NAME = "epic7autoBookmark"
+DEFAULT_CONFIG = {"adb_addr": "127.0.0.1:5555", "e7_language": "zh-TW", "adb_path": ""}
+LANGUAGES = [("zh-TW", "繁體中文"), ("zh-CN", "简体中文"), ("en-US", "English")]
+
+
+def user_data_dir() -> str:
+    """app 旁邊不能寫入時的備用位置 (例如 macOS 從「下載」直接開啟時, app 會被搬到唯讀的暫存位置)"""
+    if IS_WINDOWS:
+        base = os.getenv("APPDATA") or os.path.expanduser("~")
+    elif IS_MACOS:
+        base = os.path.expanduser("~/Library/Application Support")
+    else:
+        base = os.getenv("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, APP_NAME)
+
+
+def is_writable(folder: str) -> bool:
     try:
+        os.makedirs(folder, exist_ok=True)
+        probe = os.path.join(folder, ".write_test")
+        with open(probe, "w") as f:
+            f.write("ok")
+        os.remove(probe)
+        return True
+    except OSError:
+        return False
+
+
+def writable_dir() -> str:
+    """設定檔與日誌的存放位置: 優先放在 app 旁邊, 不行才放使用者資料夾"""
+    return app_dir() if is_writable(app_dir()) else user_data_dir()
+
+
+def existing_config_path():
+    for folder in (app_dir(), user_data_dir()):
+        path = os.path.join(folder, "config.json")
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def load_config() -> dict:
+    config = dict(DEFAULT_CONFIG)
+    path = existing_config_path()
+    if path:
         with open(path, "r", encoding="utf-8-sig") as f:
             config.update(json.load(f))
-    except FileNotFoundError:
-        print(f"config.json not found at {path}, using defaults")
     return config
 
 
-def find_adb(custom_path: str = "") -> str:
-    """回傳 adb 執行檔路徑, 找不到時回傳空字串交給 adbutils 自己處理。
+def save_config(new_config: dict) -> str:
+    path = existing_config_path() or os.path.join(writable_dir(), "config.json")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(new_config, f, ensure_ascii=False, indent=4)
+        f.write("\n")
+    return path
 
-    macOS 從 Finder 開啟的 app 不會繼承 shell 的 PATH,
-    所以除了 PATH 之外還要檢查 Homebrew / Android SDK 的常見安裝位置。
+
+def detect_adb() -> str:
+    """自動尋找 adb, 找不到回傳空字串 (交給 adbutils 用內建的 adb)。
+
+    優先用 BlueStacks 自帶的 adb: 模擬器本身也在用它, 版本一致才不會互相把連線切斷 ("closed")。
+    macOS 從 Finder 開啟的 app 不會繼承 shell 的 PATH, 所以還要檢查 Homebrew 等常見位置。
     """
-    if custom_path:
-        return os.path.expanduser(custom_path)
-    if os.getenv("ADBUTILS_ADB_PATH"):
-        return os.environ["ADBUTILS_ADB_PATH"]
-    exe = shutil.which("adb")
-    if exe:
-        return exe
     home = os.path.expanduser("~")
     if IS_MACOS:
-        candidates = [
+        emulator = ["/Applications/BlueStacks.app/Contents/MacOS/hd-adb"]
+        others = [
             "/opt/homebrew/bin/adb",
             "/usr/local/bin/adb",
             os.path.join(home, "Library/Android/sdk/platform-tools/adb"),
-            "/Applications/BlueStacks.app/Contents/MacOS/hd-adb",
         ]
     elif IS_WINDOWS:
-        candidates = [
-            os.path.join(os.getenv("LOCALAPPDATA", ""), "Android", "Sdk", "platform-tools", "adb.exe"),
+        emulator = [
             r"C:\Program Files\BlueStacks_nxt\HD-Adb.exe",
             r"C:\Program Files\BlueStacks\HD-Adb.exe",
         ]
+        others = [os.path.join(os.getenv("LOCALAPPDATA", ""), "Android", "Sdk", "platform-tools", "adb.exe")]
     else:
-        candidates = [os.path.join(home, "Android/Sdk/platform-tools/adb")]
-    for path in candidates:
-        if path and os.path.isfile(path) and os.access(path, os.X_OK):
+        emulator = []
+        others = [os.path.join(home, "Android/Sdk/platform-tools/adb")]
+
+    def usable(path):
+        return path and os.path.isfile(path) and os.access(path, os.X_OK)
+
+    for path in emulator:
+        if usable(path):
+            return path
+    exe = shutil.which("adb")
+    if exe:
+        return exe
+    for path in others:
+        if usable(path):
             return path
     return ""
+
+
+def find_adb(custom_path: str = "") -> str:
+    if custom_path:
+        return os.path.expanduser(custom_path)
+    return detect_adb()
+
+
+def apply_config(new_config: dict):
+    """套用設定: 更新全域變數, 並告訴 adbutils 要用哪個 adb"""
+    global config, adb_addr, e7_language
+    config = dict(DEFAULT_CONFIG, **new_config)
+    adb_addr = config["adb_addr"]
+    e7_language = config["e7_language"]
+    exe = find_adb(config.get("adb_path", ""))
+    if exe:
+        # adbutils 啟動 adb server 時會優先使用這個環境變數指定的 adb
+        os.environ["ADBUTILS_ADB_PATH"] = exe
+    else:
+        os.environ.pop("ADBUTILS_ADB_PATH", None)
 
 
 def load_template(*parts: str):
@@ -113,14 +185,10 @@ def load_template(*parts: str):
     return image
 
 
-config = load_config()
+config = dict(DEFAULT_CONFIG)
 adb_addr = config["adb_addr"]
 e7_language = config["e7_language"]
-
-_adb_exe = find_adb(config.get("adb_path", ""))
-if _adb_exe:
-    # adbutils 會優先使用這個環境變數指定的 adb (必須在 import adbutils 前設定)
-    os.environ["ADBUTILS_ADB_PATH"] = _adb_exe
+apply_config(load_config())
 
 from adbutils import adb, AdbDevice  # noqa: E402
 
@@ -139,7 +207,7 @@ class StopRequested(Exception):
     pass
 
 
-LOG_DIR = os.path.join(app_dir(), "logs")
+LOG_DIR = os.path.join(writable_dir(), "logs")
 DEBUG_SHOT_DIR = os.path.join(LOG_DIR, "screenshots")
 
 # 預期的模擬器解析度, 圖片模板和點擊位移都是以這個解析度做的
@@ -452,10 +520,160 @@ class worker(QtCore.QThread):
             self.isError.emit()
 
 
+class SettingsDialog(QtWidgets.QDialog):
+    """設定視窗: 第一次開啟時自動出現, 之後可從主畫面的「設定」按鈕打開"""
+
+    def __init__(self, parent=None, first_run: bool = False):
+        super().__init__(parent)
+        self.setWindowTitle("設定")
+        self.setMinimumWidth(460)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setSpacing(10)
+
+        if first_run:
+            welcome = QtWidgets.QLabel("第一次使用, 請先完成設定。之後可以從主畫面的「設定」按鈕修改。")
+            welcome.setWordWrap(True)
+            layout.addWidget(welcome)
+
+        form = QtWidgets.QFormLayout()
+        form.setLabelAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
+
+        # ADB 位址
+        self.addrEdit = QtWidgets.QLineEdit(config["adb_addr"])
+        self.addrEdit.setPlaceholderText("127.0.0.1:5555")
+        form.addRow("ADB 位址", self.addrEdit)
+        form.addRow("", self.hint("BlueStacks: 設定 → 進階 → Android調試橋(ADB) 顯示的位址"))
+
+        # 遊戲語系
+        self.langCombo = QtWidgets.QComboBox()
+        for code, name in LANGUAGES:
+            self.langCombo.addItem(f"{name} ({code})", code)
+        index = self.langCombo.findData(config["e7_language"])
+        self.langCombo.setCurrentIndex(max(index, 0))
+        form.addRow("遊戲語系", self.langCombo)
+        form.addRow("", self.hint("要跟第七史詩遊戲內的語系相同"))
+
+        # adb 路徑
+        pathRow = QtWidgets.QHBoxLayout()
+        self.pathEdit = QtWidgets.QLineEdit(config.get("adb_path", ""))
+        self.pathEdit.setPlaceholderText("留空 = 自動尋找")
+        pathRow.addWidget(self.pathEdit, 1)
+        browseButton = QtWidgets.QPushButton("瀏覽…")
+        browseButton.clicked.connect(self.browse)
+        pathRow.addWidget(browseButton)
+        detectButton = QtWidgets.QPushButton("自動偵測")
+        detectButton.clicked.connect(self.autoDetect)
+        pathRow.addWidget(detectButton)
+        form.addRow("adb 路徑", pathRow)
+        form.addRow("", self.hint("一般留空即可。出現「closed」錯誤時, 改用 BlueStacks 自帶的 adb"))
+
+        layout.addLayout(form)
+
+        # 測試連線
+        testRow = QtWidgets.QHBoxLayout()
+        testButton = QtWidgets.QPushButton("測試連線")
+        testButton.clicked.connect(self.testConnection)
+        testRow.addWidget(testButton)
+        self.resultLabel = QtWidgets.QLabel("")
+        self.resultLabel.setWordWrap(True)
+        testRow.addWidget(self.resultLabel, 1)
+        layout.addLayout(testRow)
+
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Save | QtWidgets.QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.button(QtWidgets.QDialogButtonBox.StandardButton.Save).setText("儲存")
+        buttons.button(QtWidgets.QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        buttons.accepted.connect(self.save)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self.savedPath = None
+
+    @staticmethod
+    def hint(text: str) -> QtWidgets.QLabel:
+        label = QtWidgets.QLabel(text)
+        label.setWordWrap(True)
+        label.setStyleSheet("color: gray; font-size: 11px;")
+        return label
+
+    def values(self) -> dict:
+        return {
+            "adb_addr": self.addrEdit.text().strip() or DEFAULT_CONFIG["adb_addr"],
+            "e7_language": self.langCombo.currentData(),
+            "adb_path": self.pathEdit.text().strip(),
+        }
+
+    def browse(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "選擇 adb 執行檔")
+        if path:
+            self.pathEdit.setText(path)
+
+    def autoDetect(self):
+        path = detect_adb()
+        if path:
+            self.pathEdit.setText(path)
+            self.showResult(f"找到 adb: {path}", ok=True)
+        else:
+            self.pathEdit.clear()
+            if IS_WINDOWS:
+                self.showResult("沒找到 BlueStacks 的 adb, 會使用程式內建的 adb", ok=True)
+            else:
+                self.showResult("沒找到 adb, 請安裝 adb 或按「瀏覽…」手動選擇", ok=False)
+
+    def showResult(self, text: str, ok: bool):
+        self.resultLabel.setStyleSheet(f"color: {'#2e7d32' if ok else '#c62828'};")
+        self.resultLabel.setText(text)
+
+    def testConnection(self):
+        values = self.values()
+        previous = dict(config)
+        apply_config(values)
+        self.showResult("連線中…", ok=True)
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)
+        QtWidgets.QApplication.processEvents()
+        try:
+            adb.connect(values["adb_addr"], timeout=10)
+            device = adb.device(serial=values["adb_addr"])
+            device.get_state()
+            width, height = device.screenshot().size
+            log.info(f"測試連線成功: {values['adb_addr']} 解析度 {width}x{height} adb={os.getenv('ADBUTILS_ADB_PATH')}")
+            if (width, height) == EXPECTED_SIZE:
+                self.showResult(f"連線成功, 畫面解析度 {width}x{height}", ok=True)
+            else:
+                self.showResult(
+                    f"連線成功, 但畫面解析度是 {width}x{height}, 請把模擬器改成 1920x1080", ok=False
+                )
+        except Exception as e:
+            log.warning(f"測試連線失敗: {type(e).__name__}: {e}")
+            message = f"連線失敗: {e}"
+            if "closed" in str(e).lower():
+                message += "\n可能是 adb 版本衝突, 按「自動偵測」改用模擬器自帶的 adb 再試一次"
+            else:
+                message += "\n請確認模擬器已開啟、ADB 已打開, 且位址正確"
+            self.showResult(message, ok=False)
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+            apply_config(previous)
+
+    def save(self):
+        values = self.values()
+        try:
+            self.savedPath = save_config(values)
+        except OSError as e:
+            QtWidgets.QMessageBox.warning(self, "儲存失敗", f"無法寫入設定檔:\n{e}")
+            return
+        apply_config(values)
+        log.info(f"設定已儲存: {self.savedPath} {values}")
+        self.accept()
+
+
 class Ui_Main(object):
     start = False
 
     def setupUi(self, Main):
+        self.Main = Main
         Main.setObjectName("Main")
         Main.setWindowTitle("第七史詩刷商店小工具")
         Main.resize(340, 520)
@@ -485,10 +703,16 @@ class Ui_Main(object):
         self.hintLabel.setStyleSheet("color: gray;")
         layout.addWidget(self.hintLabel)
 
+        buttonRow = QtWidgets.QHBoxLayout()
         self.startButton = QtWidgets.QPushButton("開始")
         self.startButton.setMinimumHeight(40)
         self.startButton.clicked.connect(self.startPressEvent)
-        layout.addWidget(self.startButton)
+        buttonRow.addWidget(self.startButton, 1)
+        self.settingsButton = QtWidgets.QPushButton("設定")
+        self.settingsButton.setMinimumHeight(40)
+        self.settingsButton.clicked.connect(lambda: self.openSettings(first_run=False))
+        buttonRow.addWidget(self.settingsButton)
+        layout.addLayout(buttonRow)
 
         self.statsLabel = QtWidgets.QLabel()
         layout.addWidget(self.statsLabel)
@@ -501,8 +725,9 @@ class Ui_Main(object):
         self.logTextBrowser.setPlainText(
             "使用方式:\n"
             "1. 遊戲進到秘密商店\n"
-            "2. 輸入要花掉的天空石數量 (每 3 個更新一次)\n"
-            "3. 按開始, 聖約書籤和神秘書籤出現就會自動購買\n\n"
+            "2. 第一次使用請先按「設定」確認 ADB 位址與語系\n"
+            "3. 輸入要花掉的天空石數量 (每 3 個更新一次)\n"
+            "4. 按開始, 聖約書籤和神秘書籤出現就會自動購買\n\n"
             "請自行確認金幣足夠。"
         )
         layout.addWidget(self.logTextBrowser, 1)
@@ -544,6 +769,14 @@ class Ui_Main(object):
         self.start = running
         self.startButton.setText("停止" if running else "開始")
         self.stoneSpin.setDisabled(running)
+        self.settingsButton.setDisabled(running)
+
+    def openSettings(self, first_run: bool):
+        dialog = SettingsDialog(self.Main, first_run=first_run)
+        if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+            self.logTextBrowser.append(f"設定已儲存: {dialog.savedPath}")
+        elif first_run:
+            self.logTextBrowser.append("尚未完成設定, 目前使用預設值 (按「設定」可隨時修改)")
 
     def startWorker(self):
         self.logTextBrowser.clear()
@@ -561,4 +794,7 @@ if __name__ == "__main__":
     ui = Ui_Main()
     ui.setupUi(Main)
     Main.show()
+    if existing_config_path() is None:
+        # 第一次開啟 (找不到 config.json): 主畫面出現後馬上跳出設定視窗
+        QtCore.QTimer.singleShot(0, lambda: ui.openSettings(first_run=True))
     sys.exit(app.exec())
